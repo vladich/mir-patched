@@ -74,11 +74,12 @@ static int default_mem_protect (void *addr, size_t len, MIR_mem_protect_t prot, 
 }
 
 static int default_mem_unmap (void *addr, size_t len, void *user_data CODE_ALLOC_UNUSED) {
-  return VirtualFree (addr, len, MEM_RELEASE) ? 0 : -1;
+  (void) len; /* VirtualFree with MEM_RELEASE requires dwSize == 0 */
+  return VirtualFree (addr, 0, MEM_RELEASE) ? 0 : -1;
 }
 
 static void *default_mem_map (size_t len, void *user_data CODE_ALLOC_UNUSED) {
-  return VirtualAlloc (NULL, len, MEM_COMMIT, PAGE_EXECUTE);
+  return VirtualAlloc (NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 }
 #endif
 
