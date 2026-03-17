@@ -17,7 +17,7 @@
 
 static inline int get_native_mem_protect_flags (MIR_mem_protect_t prot) {
   return prot == PROT_WRITE_EXEC ?
-#if defined(__riscv)
+#if defined(__riscv) || defined(__aarch64__) || defined(_M_ARM64)
     (PROT_WRITE | PROT_READ | PROT_EXEC)
 #else
     (PROT_WRITE | PROT_EXEC)
