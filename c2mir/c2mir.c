@@ -5307,6 +5307,10 @@ D (stmt) {
       PT (';');
     }
     r = new_pos_node2 (c2m_ctx, N_RETURN, pos, l, r);
+  } else if ((op1 = TRY (asm_spec)) != err_node) { /* asm-statement: __asm("mir insn"); */
+    PT (';');
+    /* Reuse N_ASM node but add label list as first op for consistency with other stmts */
+    r = new_pos_node2 (c2m_ctx, N_ASM, POS (op1), l, NL_HEAD (op1->u.ops));
   } else { /* expression-statement */
     if (C (';')) {
       r = new_node (c2m_ctx, N_IGNORE);
@@ -10016,6 +10020,12 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     check (c2m_ctx, expr, r);
     break;
   }
+  case N_ASM: {
+    /* Inline MIR asm statement — nothing to check, handled in gen */
+    node_t labels = NL_HEAD (r->u.ops);
+    check_labels (c2m_ctx, labels, r);
+    break;
+  }
   default: abort ();
   }
   if (e != NULL) {
@@ -10495,6 +10505,166 @@ static int push_const_val (c2m_ctx_t c2m_ctx, node_t r, op_t *res) {
 
 static MIR_insn_code_t tp_mov (MIR_type_t t) {
   return t == MIR_T_F ? MIR_FMOV : t == MIR_T_D ? MIR_DMOV : t == MIR_T_LD ? MIR_LDMOV : MIR_MOV;
+}
+
+/* === Inline MIR asm support ===
+ * Parse __asm("opcode op1, op2, op3") and emit MIR instructions directly.
+ * Operand types:
+ *   - Integer literal: 123, -42, 0x1F
+ *   - Label reference: starts with letter, looked up/created in asm_labels
+ *   - Variable reference: C variable name, resolved via reg_var_tab
+ * Supported instructions: label, jmp, mov, beq/beqs/bne/bnes/blt/blts/bgt/bgts/ble/bles/bge/bges
+ */
+
+#define ASM_MAX_LABELS 256
+
+typedef struct {
+  const char *name;
+  MIR_label_t label;
+} asm_label_t;
+
+static asm_label_t asm_labels[ASM_MAX_LABELS];
+static int asm_label_count = 0;
+
+static MIR_label_t asm_get_label (c2m_ctx_t c2m_ctx, const char *name) {
+  for (int i = 0; i < asm_label_count; i++)
+    if (strcmp (asm_labels[i].name, name) == 0) return asm_labels[i].label;
+  if (asm_label_count >= ASM_MAX_LABELS) {
+    error (c2m_ctx, no_pos, "__asm: too many labels");
+    return NULL;
+  }
+  MIR_label_t lbl = MIR_new_label (c2m_ctx->ctx);
+  asm_labels[asm_label_count].name = name;
+  asm_labels[asm_label_count].label = lbl;
+  asm_label_count++;
+  return lbl;
+}
+
+/* Find MIR register for a C variable name by searching reg_var_tab.
+ * C2MIR mangles names as PREFIX_SCOPE_CNAME. We search for entries
+ * whose suffix matches _CNAME. Returns 0 if not found. */
+struct asm_find_ctx {
+  const char *c_name;
+  int c_len;
+  MIR_reg_t found_reg;
+};
+
+static void asm_find_reg_cb (reg_var_t el, void *arg) {
+  struct asm_find_ctx *ctx = (struct asm_find_ctx *) arg;
+  if (ctx->found_reg != 0) return; /* already found */
+  const char *mname = el.name;
+  int mlen = strlen (mname);
+  /* Exact match */
+  if (mlen == ctx->c_len && strcmp (mname, ctx->c_name) == 0) {
+    ctx->found_reg = el.reg;
+    return;
+  }
+  /* Suffix match: mangled name like "I0_cname" — match the cname part */
+  if (mlen > ctx->c_len) {
+    const char *suffix = mname + mlen - ctx->c_len;
+    if (suffix[-1] == '_' && strcmp (suffix, ctx->c_name) == 0) {
+      ctx->found_reg = el.reg;
+      return;
+    }
+  }
+}
+
+static MIR_reg_t asm_find_reg (c2m_ctx_t c2m_ctx, const char *c_name) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  struct asm_find_ctx fctx;
+  fctx.c_name = c_name;
+  fctx.c_len = strlen (c_name);
+  fctx.found_reg = 0;
+  HTAB_FOREACH_ELEM (reg_var_t, reg_var_tab, asm_find_reg_cb, &fctx);
+  return fctx.found_reg;
+}
+
+static MIR_insn_code_t asm_lookup_insn (MIR_context_t ctx, const char *name) {
+  for (int i = 0; i < MIR_INSN_BOUND; i++) {
+    if (strcmp (MIR_insn_name (ctx, (MIR_insn_code_t) i), name) == 0)
+      return (MIR_insn_code_t) i;
+  }
+  return MIR_INSN_BOUND;
+}
+
+static void emit_insn (c2m_ctx_t c2m_ctx, MIR_insn_t insn); /* forward decl */
+
+static void asm_emit_mir (c2m_ctx_t c2m_ctx, const char *str) {
+  FILE *dbg = fopen("/tmp/c2mir_asm_debug.log", "a"); if (dbg) { fprintf(dbg, "asm: \"%s\"\n", str); fflush(dbg); fclose(dbg); }
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  char buf[1024];
+  char tokens[16][128];
+  int ntokens = 0;
+
+  /* Copy and tokenize: split by whitespace and commas */
+  strncpy (buf, str, sizeof (buf) - 1);
+  buf[sizeof (buf) - 1] = '\0';
+  char *p = buf;
+  while (*p && ntokens < 16) {
+    while (*p == ' ' || *p == '\t' || *p == ',') p++;
+    if (!*p) break;
+    char *start = p;
+    while (*p && *p != ' ' && *p != '\t' && *p != ',') p++;
+    int len = p - start;
+    if (len >= 128) len = 127;
+    memcpy (tokens[ntokens], start, len);
+    tokens[ntokens][len] = '\0';
+    ntokens++;
+  }
+
+  if (ntokens == 0) return;
+
+  const char *opname = tokens[0];
+
+  /* Handle pseudo-instruction: label NAME */
+  if (strcmp (opname, "label") == 0 && ntokens >= 2) {
+    MIR_label_t lbl = asm_get_label (c2m_ctx, uniq_cstr (c2m_ctx, tokens[1]).s);
+    MIR_append_insn (ctx, curr_func, lbl);
+    return;
+  }
+
+  /* Look up instruction code */
+  MIR_insn_code_t code = asm_lookup_insn (ctx, opname);
+  if (code == MIR_INSN_BOUND) {
+    error (c2m_ctx, no_pos, "__asm: unknown instruction '%s'", opname);
+    return;
+  }
+
+  /* Determine which operand positions expect labels.
+   * Branch instructions: first operand is a label.
+   * JMP: single operand is a label. */
+  int is_branch = MIR_any_branch_code_p (code);
+
+  /* Parse operands: use instruction semantics to determine types */
+  MIR_op_t ops[8];
+  int nops = 0;
+
+  for (int i = 1; i < ntokens && nops < 8; i++) {
+    /* First operand of branch/jmp is a label */
+    if (nops == 0 && is_branch) {
+      ops[nops] = MIR_new_label_op (ctx, asm_get_label (c2m_ctx, uniq_cstr (c2m_ctx, tokens[i]).s));
+    } else {
+      /* Try as integer literal first */
+      char *endp;
+      long long val = strtoll (tokens[i], &endp, 0);
+      if (*endp == '\0') {
+        ops[nops] = MIR_new_int_op (ctx, val);
+      } else {
+        /* Try as variable name */
+        MIR_reg_t reg = asm_find_reg (c2m_ctx, tokens[i]);
+        if (reg != 0) {
+          ops[nops] = MIR_new_reg_op (ctx, reg);
+        } else {
+          error (c2m_ctx, no_pos, "__asm: unknown operand '%s'", tokens[i]);
+          return;
+        }
+      }
+    }
+    nops++;
+  }
+
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, code, nops, ops));
 }
 
 static void emit_insn (c2m_ctx_t c2m_ctx, MIR_insn_t insn) {
@@ -13087,6 +13257,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                                          VARR_LENGTH (MIR_var_t, proto_info.arg_vars),
                                          VARR_ADDR (MIR_var_t, proto_info.arg_vars)));
     func_decl->u.item = curr_func;
+    asm_label_count = 0; /* reset inline MIR labels for new function */
     DLIST_INIT (MIR_insn_t, slow_code_part);
     if (ns->stack_var_p /* we can have empty struct only with size 0 and still need a frame: */
         || ns->size > 0) {
@@ -13456,6 +13627,16 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     emit_label (c2m_ctx, r);
     top_gen (c2m_ctx, NL_EL (r->u.ops, 1), NULL, NULL, NULL);
     break;
+  case N_ASM: {
+    /* Inline MIR: __asm("mir_instruction operands..."); */
+    assert (false_label == NULL && true_label == NULL);
+    emit_label (c2m_ctx, r);
+    node_t str_node = NL_EL (r->u.ops, 1);
+    if (str_node != NULL && str_node->code == N_STR) {
+      asm_emit_mir (c2m_ctx, str_node->u.s.s);
+    }
+    break;
+  }
   default: abort ();
   }
 finish:
